@@ -1,0 +1,9 @@
+node_modules/
+.probe*
+.failover/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+coverage/

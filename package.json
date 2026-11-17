@@ -1,0 +1,23 @@
+{
+  "name": "t3-account-failover",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Resume usage-limited T3 Codex threads on another connected account",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "t3-failover": "bin/t3-failover.mjs"
+  },
+  "scripts": {
+    "test": "node --test",
+    "doctor": "node bin/t3-failover.mjs doctor",
+    "start": "node bin/t3-failover.mjs watch",
+    "verify:live": "node scripts/verify-live.mjs",
+    "replay:incident": "node scripts/replay-incident.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

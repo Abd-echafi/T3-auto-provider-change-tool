@@ -1,0 +1,30 @@
+import assert from 'node:assert/strict';
+import {homedir} from 'node:os';
+import {join} from 'node:path';
+import {T3Client} from '../src/t3-client.mjs';
+import {makeCommand,pickAccount,accountDiagnostics,validateConfig,newState} from '../src/policy.mjs';
+import {WriterGuard} from '../src/writer-guard.mjs';
+const home=process.env.T3CODE_HOME??join(homedir(),'.t3');
+const client=await new T3Client({t3Home:home,t3Command:join(home,'bin/t3'),writable:true}).connect();
+try {
+ const config=await client.getConfig();
+ const shell=await client.getShell();
+ const accounts=config.providers.filter(p=>p.driver==='codex'&&p.enabled);
+ assert.ok(accounts.length>=2);
+ const candidate=shell.threads.find(t=>Array.isArray(t.modelSelection.options)&&accounts.some(p=>p.instanceId===t.providerInstanceId));
+ assert.ok(candidate);
+ const projection=await client.getProjection(candidate.id);
+ const policy=validateConfig({accountOrder:accounts.map(p=>p.instanceId)});
+ const state=newState();
+ const target=pickAccount(accounts,candidate,state,policy,Date.now());
+ assert.ok(target,'No usable replacement account: '+JSON.stringify(accountDiagnostics(accounts,candidate,state,policy,Date.now())));
+ const planned=makeCommand(candidate,{id:'validation-only'},target.instanceId);
+ assert.deepEqual(planned.modelSelection.options,candidate.modelSelection.options);
+ const lock=await new WriterGuard().probe(projection,accounts.find(p=>p.instanceId===candidate.providerInstanceId));
+ assert.notEqual(lock.status,'unknown');
+ assert.ok(client.compatibility.checks.includes('dispatch rejection'));
+ assert.ok(client.compatibility.checks.includes('writer-release rejection'));
+ console.log('PASS: T3 '+client.version+' passed protocol '+client.compatibility.protocol+' capability validation without a version allowlist.');
+ console.log('PASS: live account selection chose '+target.instanceId+' and preserved model options; writer probe returned '+lock.status+'.');
+ console.log('No existing thread was stopped, created, or resumed.');
+} finally {await client.close();}
