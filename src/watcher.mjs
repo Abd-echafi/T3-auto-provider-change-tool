@@ -1,4 +1,4 @@
-import { shellEligible, blockedRun, observeFailure, pickAccount, makeCommand, accountReason, accountDiagnostics } from './policy.mjs';
+import { SUPPORTED_DRIVERS, shellEligible, blockedRun, observeFailure, pickAccount, makeCommand, accountReason, accountDiagnostics } from './policy.mjs';
 import { RpcError } from './t3-client.mjs';
 import { WriterGuard } from './writer-guard.mjs';
 
@@ -93,12 +93,17 @@ export class Watcher {
     if (!Array.isArray(threads)) throw new Error('Unsupported T3 thread snapshot.');
     await this.confirmContinuations(threads);
     for (const shell of threads) {
-      if (!shellEligible(shell, this.config, this.state, now)) continue;
       const source = config.providers.find(p => p.instanceId === shell.providerInstanceId);
-      if (source?.driver !== 'codex') continue;
+      if (!SUPPORTED_DRIVERS.includes(source?.driver) || !shellEligible(shell, this.config, this.state, now, source.driver)) continue;
       const projection = await this.client.getProjection(shell.id);
       const blocked = blockedRun(projection, shell);
-      if (!blocked) { this.notice(shell.id, 'Thread changed, has queued work, or needs user input.'); continue; }
+      if (!blocked) {
+        const run = projection.runs.find(r => r.id === shell.latestRunId);
+        const missing = run && !projection.messages.some(m => m.id === run.userMessageId);
+        this.notice(shell.id, missing ? 'Cannot verify whether the stopped run was maintenance: source message metadata is unavailable.'
+          : 'Thread changed, has queued work, or needs user input.');
+        continue;
+      }
       const { run, failure } = blocked;
       observeFailure(this.state, run, failure, this.config, now);
       // Save source quarantine even when no account is currently usable.
@@ -142,27 +147,29 @@ export class Watcher {
       }
       // Before the first send, account usage may change during a writer wait.
       // Once a send was attempted, preserve its ID and payload for replay.
+      const target = config.providers.find(p => p.instanceId === attempt.targetId);
       if (!attempt.dispatchAttemptedAt) {
-        const target = config.providers.find(p => p.instanceId === attempt.targetId);
         const selection = { ...shell.modelSelection, runtimeMode: shell.runtimeMode };
-        if (!target || accountReason(target, selection, this.state, this.config, now)) {
+        if (target?.driver !== source.driver || accountReason(target, selection, this.state, this.config, now)) {
           const replacement = pickAccount(config.providers, shell, this.state, this.config, now);
-          if (!replacement) { this.notice(shell.id, 'Waiting for usable quota while preparing the writer handoff.'); continue; }
+          if (!replacement) { this.notice(shell.id, 'Waiting for usable quota before resuming.'); continue; }
           attempt.targetId = replacement.instanceId;
           attempt.command = makeCommand(projection.thread, run, replacement.instanceId);
           await this.save(this.state);
         }
+      } else if (target?.driver !== source.driver) {
+        this.notice(shell.id, 'The original recovery target is no longer available in the same provider family.');
+        continue;
       }
-      // T3 0.1.9 can retain the source writer after a native account switch.
-      // Release while it still belongs to the source, then observe the actual
-      // OS lock before issuing a continuation on the destination account.
-      if (!await this.writerReady(attempt, projection, shell, source)) continue;
+      // Codex can retain a native writer across an account switch. Antigravity
+      // uses T3's provider handoff between isolated profiles instead.
+      if (source.driver === 'codex' && !await this.writerReady(attempt, projection, shell, source)) continue;
       const current = (await this.client.getShell()).threads.find(t => t.id === shell.id);
-      if (!current || !shellEligible(current, this.config, this.state, now) || current.latestRunId !== run.id ||
+      if (!current || !shellEligible(current, this.config, this.state, now, source.driver) || current.latestRunId !== run.id ||
           current.providerInstanceId !== shell.providerInstanceId || current.runtimeMode !== shell.runtimeMode ||
           JSON.stringify(current.modelSelection) !== JSON.stringify(shell.modelSelection) ||
           !blockedRun(await this.client.getProjection(shell.id), current)) {
-        this.notice(shell.id, 'Thread changed while preparing the writer handoff.');
+        this.notice(shell.id, 'Thread changed while preparing to resume.');
         continue;
       }
       try {

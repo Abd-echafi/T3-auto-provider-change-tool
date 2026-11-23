@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { T3Client, CompatibilityError } from '../src/t3-client.mjs';
 import { ORCHESTRATION_PROTOCOL } from '../src/compatibility.mjs';
-import { DEFAULTS, newState, validateConfig } from '../src/policy.mjs';
+import { DEFAULTS, SUPPORTED_DRIVERS, newState, validateConfig } from '../src/policy.mjs';
 import { acquireLock, readJson, writeJson } from '../src/store.mjs';
 import { Watcher } from '../src/watcher.mjs';
 
@@ -58,9 +58,14 @@ async function init(config) {
   try {
     const { providers } = await client.getConfig();
     const accountOrder = providers.filter(p => p.driver === 'codex' && p.enabled).map(p => p.instanceId);
-    if (accountOrder.length < 2) throw new Error('Connect at least two Codex accounts in T3 first.');
-    await writeJson(configPath, { ...DEFAULTS, t3Home: config.t3Home, t3Command: config.t3Command, accountOrder });
-    console.log(`Configured ${accountOrder.length} accounts: ${configPath}`);
+    const antigravityAccountOrder = providers.filter(p => p.driver === 'antigravity' && p.enabled).map(p => p.instanceId);
+    if (Math.max(accountOrder.length, antigravityAccountOrder.length) < 2) {
+      throw new Error('Connect at least two accounts of the same provider type (Codex or Antigravity) in T3 first.');
+    }
+    await writeJson(configPath, {
+      ...DEFAULTS, t3Home: config.t3Home, t3Command: config.t3Command, accountOrder, antigravityAccountOrder,
+    });
+    console.log(`Configured ${accountOrder.length} Codex and ${antigravityAccountOrder.length} Antigravity accounts in ${configPath}`);
   } finally { await client.close(); }
 }
 
@@ -71,13 +76,17 @@ async function doctor(config) {
     const { providers } = await client.getConfig();
     const shell = await client.getShell();
     console.log(`Connected to T3 ${client.version}. ${shell.threads.length} active threads.`);
-    for (const p of providers.filter(p => p.driver === 'codex' && p.enabled)) {
-      const quota = p.usageLimits?.windows?.map(w => `${w.label}: ${100 - w.usedPercent}% left`).join(', ') || 'usage unavailable';
-      console.log(`${p.instanceId}: ${p.status}; ${quota}`);
+    for (const p of providers.filter(p => SUPPORTED_DRIVERS.includes(p.driver) && p.enabled)) {
+      const limits = p.usageLimits;
+      const age = Date.now() - Date.parse(limits?.checkedAt);
+      const quota = limits?.unavailable ? 'usage unavailable' : age > config.usageMaxAgeSeconds * 1000
+        ? 'usage snapshot is stale'
+        : limits?.windows?.map(w => `${w.label}: ${100 - w.usedPercent}% left`).join(', ') || 'usage unavailable';
+      console.log(`${p.instanceId} (${p.driver}): ${p.status}; ${quota}`);
     }
     console.log(`Config: ${configPath}`);
     console.log(`State: ${statePath}`);
-    console.log(`Scope: ${config.threadIds.length ? config.threadIds.join(', ') : config.projectIds.length ? config.projectIds.join(', ') : 'all top-level Codex threads'}`);
+    console.log(`Scope: ${config.threadIds.length ? config.threadIds.join(', ') : config.projectIds.length ? config.projectIds.join(', ') : 'all top-level Codex and Antigravity threads'}`);
     const conflicts = shell.threads.filter(t => /another Codex client|already has an active writer/i.test(t.lastError ?? ''));
     if (conflicts.length) console.log(`${conflicts.length} existing thread(s) report a writer conflict. Existing manual-switch failures are not automatically replayed.`);
     console.log(`Compatibility: orchestration protocol ${ORCHESTRATION_PROTOCOL}; app release number does not restrict connection.`);
@@ -205,7 +214,7 @@ async function service() {
 
 async function main() {
   if (command === 'help' || command === '--help' || command === '-h') {
-    console.log(`T3 account failover (capability checks / orchestration protocol ${ORCHESTRATION_PROTOCOL} / Codex)
+    console.log(`T3 account failover (capability checks / orchestration protocol ${ORCHESTRATION_PROTOCOL} / Codex and Antigravity)
 
   init                  Discover connected accounts and write config
   doctor                Verify the connection and show remaining quotas
@@ -218,7 +227,7 @@ Options: --config PATH, --state-dir PATH
 Watch:   --dry-run, --once, --include-existing
 
 New failures only by default. --include-existing opts into recent stopped threads.
-All top-level Codex threads are watched; set projectIds or threadIds to narrow scope.`);
+All top-level Codex and Antigravity threads are watched; set projectIds or threadIds to narrow scope.`);
     return;
   }
   if (!['init', 'doctor', 'watch', 'service-install', 'service-status', 'service-uninstall'].includes(command)) throw new Error(`Unknown command: ${command}`);

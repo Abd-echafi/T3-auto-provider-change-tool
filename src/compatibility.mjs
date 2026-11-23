@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { SUPPORTED_DRIVERS } from './policy.mjs';
 
 export const ORCHESTRATION_PROTOCOL = '2';
 
@@ -37,9 +38,9 @@ export function validateProviders(config) {
   for (const provider of config.providers) {
     requireShape(record(provider) && id(provider.instanceId) && id(provider.driver),
       'provider snapshot', 'missing provider identity');
-    if (provider.driver !== 'codex' || !provider.enabled) continue;
+    if (!SUPPORTED_DRIVERS.includes(provider.driver) || !provider.enabled) continue;
     requireShape(typeof provider.installed === 'boolean' && id(provider.status) && record(provider.auth) &&
-      id(provider.auth.status) && Array.isArray(provider.models), 'provider snapshot', 'incomplete Codex account state');
+      id(provider.auth.status) && Array.isArray(provider.models), 'provider snapshot', `incomplete ${provider.driver} account state`);
     for (const model of provider.models) {
       requireShape(record(model) && id(model.slug), 'model catalog', 'missing model slug');
       const descriptors = model.capabilities?.optionDescriptors;
@@ -109,9 +110,12 @@ export async function inspectCapabilities(client, writable) {
   // Read current shapes, accepting extra fields and any release label.
   validateProviders(config);
   validateShell(shell);
-  const codex = new Set(config.providers.filter(p => p.driver === 'codex' && p.enabled).map(p => p.instanceId));
-  const sample = shell.threads.find(t => codex.has(t.providerInstanceId) && t.latestRunId);
-  if (sample) validateProjection(await client.getProjection(sample.id), sample.id);
+  const samples = SUPPORTED_DRIVERS.map(driver => {
+    const accounts = new Set(config.providers.filter(p => p.driver === driver && p.enabled).map(p => p.instanceId));
+    return shell.threads.find(t => accounts.has(t.providerInstanceId) && t.latestRunId);
+  }).filter(Boolean);
+  for (const sample of samples) validateProjection(await client.getProjection(sample.id), sample.id);
+  const [sample] = samples;
   if (writable) {
     // Never probe a real thread with a deliberately wrong runId: a future
     // server that ignores that field could stop it. Both target IDs are new,

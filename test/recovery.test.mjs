@@ -43,6 +43,29 @@ function fixture() {
   return { state, config, shell, run, failure, projection, providers: [provider('a', 100), provider('b'), provider('c'), provider('d')] };
 }
 
+function antigravityFixture() {
+  const f = fixture();
+  const sourceId = 'antigravity_4';
+  f.shell.providerInstanceId = f.run.providerInstanceId = sourceId;
+  f.shell.modelSelection = { instanceId: sourceId, model: 'gemini-4-neon', options: [{ id: 'thought_level', value: 'medium' }] };
+  f.projection.thread = structuredClone(f.shell);
+  const account = (id, used) => ({
+    ...provider(id), driver: 'antigravity',
+    models: [{ slug: 'gemini-4-neon', capabilities: { optionDescriptors: [
+      { id: 'thought_level', type: 'select', options: [{ id: 'medium' }] },
+    ] } }],
+    usageLimits: { checkedAt: iso(now), windows: [
+      { id: '3p-5h', usedPercent: 100 }, { id: 'gemini-5h', usedPercent: used },
+      { id: 'gemini-weekly', usedPercent: 10 }, { id: 'gemini-argon-wtu-weekly', usedPercent: 100 },
+    ] },
+  });
+  const codex = { ...account('b', 0), driver: 'codex' };
+  codex.usageLimits.windows = [{ id: 'primary', usedPercent: 0 }];
+  f.providers = [account(sourceId, 100), codex,
+    account('antigravity_5', 10), account('antigravity_6', 15)];
+  return f;
+}
+
 test('selects the next usable account, wraps, and preserves all model options', () => {
   const f = fixture();
   assert.equal(pickAccount(f.providers, f.shell, f.state, f.config, now).instanceId, 'b');
@@ -56,6 +79,33 @@ test('selects the next usable account, wraps, and preserves all model options', 
   assert.deepEqual(command.modelSelection, { ...f.shell.modelSelection, instanceId: 'b' });
   assert.equal(command.manualContinuationOfRunId, 'run-1');
   assert.equal(command.commandId, makeCommand(f.projection.thread, f.run, 'b').commandId);
+});
+
+test('each account order can only select accounts of the failed provider type', () => {
+  const codex = fixture();
+  codex.providers[1].driver = 'antigravity';
+  assert.equal(pickAccount(codex.providers, codex.shell, codex.state, codex.config, now).instanceId, 'c');
+
+  const ag = antigravityFixture();
+  assert.equal(pickAccount(ag.providers, ag.shell, ag.state, ag.config, now).instanceId, 'antigravity_5');
+  ag.config.antigravityAccountOrder = ['antigravity_4', 'b', 'antigravity_6', 'antigravity_5'];
+  assert.equal(pickAccount(ag.providers, ag.shell, ag.state, ag.config, now).instanceId, 'antigravity_6');
+
+  for (const account of ag.providers.slice(2)) account.usageLimits.windows[2].usedPercent = 100;
+  assert.equal(pickAccount(ag.providers, ag.shell, ag.state, ag.config, now), null);
+});
+
+test('Antigravity uses quota for the selected model family and skips stale readings', () => {
+  const f = antigravityFixture();
+  f.providers[2].usageLimits.checkedAt = iso(now - 700_000);
+  assert.equal(pickAccount(f.providers, f.shell, f.state, f.config, now).instanceId, 'antigravity_6');
+  const target = f.providers[3];
+  target.models.push({ slug: 'gemini-4-argon' }, { slug: 'claude-opus-5-5' });
+  assert.equal(accountReason(target, { model: 'gemini-4-argon' }, f.state, f.config, now), 'quota exhausted');
+  assert.equal(accountReason(target, { model: 'claude-opus-5-5' }, f.state, f.config, now), 'quota exhausted');
+  target.usageLimits.windows = [{ id: 'claude-quota', usedPercent: 10 }];
+  assert.equal(accountReason(target, { model: 'claude-opus-5-5' }, f.state, f.config, now), null);
+  assert.equal(accountReason(target, f.shell.modelSelection, f.state, f.config, now), 'usage unknown for this model');
 });
 
 test('regression: real T3 option lists keep eligible accounts available', () => {
@@ -189,6 +239,30 @@ function harness(f, extra = {}) {
     writerGuard: { probe: async () => ({ status: 'free' }) }, ...extra });
   return { watcher, client, commands, saved, logs };
 }
+
+test('an existing Codex config auto-discovers Antigravity and resumes it with its model options', async () => {
+  const f = antigravityFixture();
+  const h = harness(f, { writerGuard: { probe: async () => assert.fail('Codex writer check used for Antigravity') } });
+  await h.watcher.tick();
+  assert.equal(h.commands.length, 1);
+  assert.equal(h.commands[0].manualContinuationOfRunId, f.run.id);
+  assert.deepEqual(h.commands[0].modelSelection, { ...f.shell.modelSelection, instanceId: 'antigravity_5' });
+  f.shell.latestRunId = 'run-2';
+  f.shell.status = 'running';
+  f.projection.runs.push({ id: 'run-2', status: 'running', userMessageId: h.commands[0].messageId });
+  await h.watcher.tick();
+  assert.equal(h.logs.at(-1).event, 'resume-confirmed');
+  assert.equal(h.logs.at(-1).account, 'antigravity_5');
+});
+
+test('an explicit Antigravity account order limits which stopped threads are watched', async () => {
+  const f = antigravityFixture();
+  f.config.antigravityAccountOrder = ['antigravity_5', 'antigravity_6'];
+  const h = harness(f);
+  await h.watcher.tick();
+  assert.equal(h.commands.length, 0);
+  assert.equal(Object.keys(f.state.observedFailures).length, 0);
+});
 
 test('persists intent before dispatch and suppresses duplicate recovery on subsequent ticks and restart', async () => {
   const f = fixture(), h = harness(f);

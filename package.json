@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Resume usage-limited T3 Codex threads on another connected account",
+  "description": "Resume usage-limited T3 Codex and Antigravity threads on another account of the same provider",
   "engines": {
     "node": ">=20.11"
   },

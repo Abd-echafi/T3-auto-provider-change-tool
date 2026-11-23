@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { CompatibilityError, ORCHESTRATION_PROTOCOL, inspectCapabilities,
   validateProviders, validateShell, validateProjection } from './compatibility.mjs';
@@ -29,10 +30,12 @@ async function cli(command, args) {
 }
 
 export class T3Client {
-  constructor({ t3Home, t3Command, writable = false }) {
+  constructor({ t3Home, t3Command, writable = false,
+    pythonCommand = process.platform === 'darwin' ? '/usr/bin/python3' : 'python3' }) {
     this.home = t3Home;
     this.command = t3Command;
     this.writable = writable;
+    this.pythonCommand = pythonCommand;
     this.pending = new Map();
     this.nextId = 0;
   }
@@ -149,7 +152,29 @@ export class T3Client {
   async getConfig() { return validateProviders(await this.requiredRead('server.getConfig')); }
   async getShell() { return validateShell(await this.http('/api/orchestration/shell')); }
   async getProjection(threadId) {
-    return validateProjection(await this.requiredRead('orchestration.getThreadProjection', { threadId }), threadId);
+    const projection = validateProjection(await this.requiredRead('orchestration.getThreadProjection', { threadId }), threadId);
+    const latest = projection.runs.filter(r => r.status !== 'queued' && !(r.status === 'cancelled' && !r.startedAt))
+      .sort((a, b) => (Date.parse(b.completedAt) - Date.parse(a.completedAt)) || b.ordinal - a.ordinal)[0];
+    if (latest?.status === 'failed' && !projection.messages.some(m => m.id === latest.userMessageId) &&
+        projection.turnItems.some(i => i.type === 'error' && i.runId === latest.id &&
+          i.nodeId === latest.rootNodeId && i.failure?.class === 'usage_limit')) {
+      const metadata = await this.readMessageMetadata(threadId, latest.id, latest.userMessageId);
+      if (metadata) projection.messages.push(metadata);
+    }
+    return projection;
+  }
+
+  async readMessageMetadata(threadId, runId, messageId) {
+    try {
+      const { stdout } = await execute(this.pythonCommand, [
+        fileURLToPath(new URL('../scripts/read-message-metadata.py', import.meta.url)),
+        join(this.home, 'userdata/statev2.sqlite'), threadId, runId, messageId,
+      ], { timeout: 5000, maxBuffer: 4000 });
+      const value = JSON.parse(stdout);
+      if (value?.id !== messageId || value.role !== 'user' ||
+          !Object.hasOwn(value, 'idleCompaction')) return null;
+      return { id: value.id, role: value.role, idleCompaction: value.idleCompaction };
+    } catch { return null; } // Unknown DB layouts leave the run ineligible, never guess.
   }
   refreshProviders() { return this.requiredRead('server.refreshProviders'); }
   async releaseWriter(threadId, runId) {

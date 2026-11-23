@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 
+export const SUPPORTED_DRIVERS = ['codex', 'antigravity'];
+
 export const DEFAULTS = {
-  accountOrder: [], projectIds: [], threadIds: [],
+  accountOrder: [], antigravityAccountOrder: [], projectIds: [], threadIds: [],
   pollSeconds: 10, refreshSeconds: 300, usageMaxAgeSeconds: 600,
   failureMaxAgeHours: 336, maxSwitchesPerHour: 4,
   unknownResetCooldownSeconds: 300,
@@ -17,7 +19,7 @@ export function validateConfig(input) {
   for (const key of Object.keys(input)) {
     if (!(key in DEFAULTS) && !['t3Home', 't3Command', 'pythonCommand'].includes(key)) throw new Error(`Unknown config field: ${key}`);
   }
-  for (const key of ['accountOrder', 'projectIds', 'threadIds']) {
+  for (const key of ['accountOrder', 'antigravityAccountOrder', 'projectIds', 'threadIds']) {
     if (!Array.isArray(config[key]) || config[key].some(v => typeof v !== 'string' || !v.trim()) ||
         new Set(config[key]).size !== config[key].length) throw new Error(`${key} must be an array of unique, nonempty IDs.`);
   }
@@ -33,14 +35,24 @@ export function validateConfig(input) {
   return config;
 }
 
-export function shellEligible(thread, config, state, now) {
+function configuredOrder(config, driver) {
+  return (driver === 'antigravity' ? config.antigravityAccountOrder : config.accountOrder) ?? [];
+}
+
+function accountPool(providers, config, driver) {
+  const order = configuredOrder(config, driver);
+  return order.length ? order : providers.filter(p => p.driver === driver && p.enabled).map(p => p.instanceId);
+}
+
+export function shellEligible(thread, config, state, now, driver = 'codex') {
   if (thread.status !== 'failed' || thread.lastErrorClass !== 'usage_limit' || thread.activeRunId ||
       thread.pendingRuntimeRequest || thread.archivedAt || thread.deletedAt ||
       (thread.pendingBackgroundTasks?.length ?? 0) > 0 ||
       thread.settledOverride === 'settled' || thread.lineage?.relationshipToParent === 'subagent') return false;
   if (config.projectIds.length && !config.projectIds.includes(thread.projectId)) return false;
   if (config.threadIds.length && !config.threadIds.includes(thread.id)) return false;
-  if (config.accountOrder.length && !config.accountOrder.includes(thread.providerInstanceId)) return false;
+  const order = configuredOrder(config, driver);
+  if (order.length && !order.includes(thread.providerInstanceId)) return false;
   // Respect an explicit snooze, but allow T3's automatic usage-limit snooze.
   if (Date.parse(thread.snoozedUntil) > now && thread.limitRecovery?.runId !== thread.latestRunId) return false;
   const failedAt = Date.parse(thread.latestRunCompletedAt);
@@ -87,8 +99,24 @@ function identity(provider) {
     (provider.auth?.email ? `${provider.auth.email}:${provider.auth.workspaceId ?? ''}` : provider.instanceId);
 }
 
+function antigravityWindows(windows, model) {
+  const [family, ...modelParts] = model.toLowerCase().split('-');
+  if (!['gemini', 'claude', 'gpt'].includes(family)) return windows;
+  // Current snapshots use shared family buckets and Argon/Carbon buckets.
+  // Older snapshots use model-family names, and unscoped windows still apply.
+  return windows.filter(window => {
+    const [windowFamily, scope] = typeof window.id === 'string' ? window.id.split('-') : [];
+    if (windowFamily === '3p') return family === 'claude' || family === 'gpt';
+    if (windowFamily === 'gemini') {
+      return family === 'gemini' && (!['argon', 'carbon'].includes(scope) || modelParts.includes(scope));
+    }
+    if (windowFamily === 'claude' || windowFamily === 'gpt') return family === windowFamily;
+    return true;
+  });
+}
+
 export function accountReason(provider, selection, state, config, now) {
-  if (provider.driver !== 'codex' || !provider.enabled || !provider.installed || provider.status !== 'ready' ||
+  if (!SUPPORTED_DRIVERS.includes(provider.driver) || !provider.enabled || !provider.installed || provider.status !== 'ready' ||
       provider.availability === 'unavailable' || provider.auth?.status !== 'authenticated') return 'unavailable';
   const model = provider.models?.find(m => m.slug === selection.model);
   if (!model) return 'model unavailable';
@@ -107,9 +135,11 @@ export function accountReason(provider, selection, state, config, now) {
   }
   const limits = provider.usageLimits;
   if (!limits?.windows?.length || limits.unavailable) return 'usage unknown';
+  const windows = provider.driver === 'antigravity' ? antigravityWindows(limits.windows, selection.model) : limits.windows;
+  if (!windows.length) return 'usage unknown for this model';
   const checkedAt = Date.parse(limits.checkedAt);
   if (!Number.isFinite(checkedAt) || now - checkedAt > config.usageMaxAgeSeconds * 1000) return 'usage stale';
-  if (limits.windows.some(w => !Number.isFinite(w.usedPercent) || w.usedPercent >= 100)) return 'quota exhausted';
+  if (windows.some(w => !Number.isFinite(w.usedPercent) || w.usedPercent < 0 || w.usedPercent >= 100)) return 'quota exhausted';
   const cooldown = state.cooldowns[provider.instanceId];
   if (cooldown && (now < cooldown.until || checkedAt <= cooldown.observedAt)) return 'recent limit; awaiting fresh quota';
   return null;
@@ -117,29 +147,29 @@ export function accountReason(provider, selection, state, config, now) {
 
 export function accountDiagnostics(providers, shell, state, config, now) {
   const source = providers.find(p => p.instanceId === shell.providerInstanceId);
-  const ids = config.accountOrder.length ? config.accountOrder :
-    providers.filter(p => p.driver === 'codex' && p.enabled).map(p => p.instanceId);
+  if (!SUPPORTED_DRIVERS.includes(source?.driver)) return [];
+  const ids = accountPool(providers, config, source.driver);
   return ids.map(id => {
     const provider = providers.find(p => p.instanceId === id);
-    let reason = provider ? accountReason(provider,
-      { ...shell.modelSelection, runtimeMode: shell.runtimeMode }, state, config, now) : 'account missing';
+    if (!provider) return { accountId: id, reason: 'account missing' };
+    if (provider.driver !== source.driver) return { accountId: id, reason: 'different provider type' };
+    let reason = accountReason(provider, { ...shell.modelSelection, runtimeMode: shell.runtimeMode }, state, config, now);
     if (id === shell.providerInstanceId) reason ??= 'current account';
-    else if (provider && source && identity(provider) === identity(source)) reason = 'same account identity';
+    else if (identity(provider) === identity(source)) reason = 'same account identity';
     return { accountId: id, reason: reason ?? 'eligible' };
   });
 }
 
 export function pickAccount(providers, shell, state, config, now) {
   const source = providers.find(p => p.instanceId === shell.providerInstanceId);
-  if (source?.driver !== 'codex') return null;
-  const ordered = config.accountOrder.length ? config.accountOrder :
-    providers.filter(p => p.driver === 'codex' && p.enabled).map(p => p.instanceId);
+  if (!SUPPORTED_DRIVERS.includes(source?.driver)) return null;
+  const ordered = accountPool(providers, config, source.driver);
   const pivot = ordered.indexOf(shell.providerInstanceId);
   if (pivot < 0) return null;
   // Try the next account in the configured order, wrapping at the end.
   const chain = [...ordered.slice(pivot + 1), ...ordered.slice(0, pivot)];
   const selection = { ...shell.modelSelection, runtimeMode: shell.runtimeMode };
-  const next = chain.map(id => providers.find(p => p.instanceId === id)).find(p => p &&
+  const next = chain.map(id => providers.find(p => p.instanceId === id)).find(p => p?.driver === source.driver &&
     identity(p) !== identity(source) && !accountReason(p, selection, state, config, now));
   // If the whole pool was empty, the current account may refill first.
   if (!next && state.cooldowns[source.instanceId] && !accountReason(source, selection, state, config, now)) return source;

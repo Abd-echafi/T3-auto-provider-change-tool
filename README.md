@@ -1,11 +1,11 @@
 # T3 account failover
 
-A local macOS companion that watches T3 Code for Codex usage-limit failures,
-chooses the next connected account with quota, and asks T3 to continue the same
-thread. It keeps the selected model, reasoning effort, service tier, and thread
-permissions. It uses T3's guarded manual-continuation command, rather than UI clicks.
+A local macOS companion that watches T3 Code for Codex and Antigravity usage
+limits and asks T3 to continue the same thread on the next eligible account of
+the same provider. It uses T3's guarded manual-continuation command and keeps
+the selected model, model options, and thread permissions.
 
-Built and verified against **T3 Code 0.1.9 and 0.1.10**, **Node 20.20.1**, and macOS's
+Checked against **T3 Code 0.1.9 through 0.1.11**, **Node 20.20.1**, and macOS's
 `/usr/bin/python3` for advisory-lock inspection. This is an
 unofficial companion using orchestration protocol 2. **There is no app-version
 allowlist.** Any release that passes the required capability checks can connect.
@@ -14,7 +14,8 @@ Codex login files, or require OpenAI API keys.
 
 ## Setup
 
-Keep T3 Code running and connect your Codex accounts there. Download the tool:
+Keep T3 Code running and connect at least two accounts of the same provider.
+Download the tool:
 
 ```sh
 git clone https://github.com/Abd-echafi/T3-auto-provider-change-tool.git
@@ -26,11 +27,12 @@ node bin/t3-failover.mjs watch --dry-run --once
 node bin/t3-failover.mjs service-install
 ```
 
-`init` discovers your enabled Codex accounts and saves their order in
-`~/.config/t3-account-failover/config.json`. `service-install` starts the watcher
-now and at macOS login. The Mac must be awake; if T3 is closed, the watcher keeps
-trying to reconnect. Keep this project directory in place while the service is
-installed.
+`init` discovers enabled Codex and Antigravity accounts and saves each rotation
+order in `~/.config/t3-account-failover/config.json`. Existing configs discover
+enabled Antigravity accounts automatically unless they set an explicit order.
+`service-install` starts the watcher immediately and at macOS login. The Mac
+must be awake. If T3 closes, the watcher keeps trying to reconnect. Keep this
+project directory in place while the service is installed.
 
 To run in a terminal instead:
 
@@ -39,7 +41,7 @@ node bin/t3-failover.mjs watch
 ```
 
 By default it handles failures **after its first real start**, across top-level
-Codex threads in this T3 environment. Existing stopped threads are left alone.
+Codex and Antigravity threads in this T3 environment.
 To opt into recovering existing failures within the configured age window:
 
 ```sh
@@ -58,10 +60,10 @@ environment; do not start multiple live watchers with different state directorie
 2. It confirms the run is still the latest and has no active turn, queued turn,
    pending user request, or pending background task. It excludes idle compaction
    and subagent threads.
-3. It walks the configured account order after the failed account, wrapping
-   around. A target needs a working login, the same model and options, and fresh
-   quota readings with headroom in every reported window.
-4. It checks the native conversation's actual OS writer lock. If it is held, it
+3. It walks the failed provider's account order, starting after the failed
+   account and wrapping around. A target needs a working login, the same model
+   and options, and fresh readings with headroom in the relevant quota windows.
+4. For Codex, it checks the native conversation's OS writer lock. If it is held, it
    asks T3 to stop/release that conversation with the stopped run's ID as a guard.
    T3 refuses if a newer run has started and protects other working threads that
    share the provider process. The watcher waits for the lock to become free
@@ -85,21 +87,21 @@ must subsequently have a newer healthy reading. Several threads failing on one
 account share this quarantine. There are at most four automatic continuations per
 thread per hour.
 
-If every account is empty, the watcher waits for a usable account to refill. The
-original account can also resume after its reset. There is always a short gap for
-detection and reconnection; work cannot run while every account is exhausted.
-Failures older than 14 days are left for manual recovery by default.
+If every account in a provider's rotation is empty, the watcher waits for usable
+quota. The original account can also resume after its reset. Failures older than
+14 days are left for manual recovery by default.
 
 ## Scope and settings
 
 Edit the generated config, then uninstall and reinstall the service to reload it.
-An empty `threadIds` and `projectIds` watches all top-level Codex threads. To limit
-it to a thread, set `threadIds` to its T3 thread ID. Project and thread filters
-are combined when both are supplied.
+Empty `threadIds` and `projectIds` watch all top-level Codex and Antigravity
+threads. To limit recovery to a thread, set `threadIds` to its T3 thread ID.
+Project and thread filters are combined when both are supplied.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `accountOrder` | discovered accounts | Rotation order; accounts outside this list are untouched |
+| `accountOrder` | discovered Codex accounts | Codex account IDs in rotation order |
+| `antigravityAccountOrder` | discovered Antigravity accounts | Antigravity account IDs in rotation order |
 | `threadIds` | `[]` | Optional thread allowlist |
 | `projectIds` | `[]` | Optional project allowlist |
 | `pollSeconds` | `10` | Failure detection interval |
@@ -149,12 +151,13 @@ mode `0600`. A crash can leave a T3 session active until its 12-hour expiry.
 
 ## Limits
 
-- Only Codex account rotation on the local T3 environment is implemented.
+- Account rotation runs in the local T3 environment.
 - Pending approvals, queued work, background tasks, manually snoozed threads,
   settled threads, and subagent threads are left for manual handling.
-- Context continuity follows T3's own account-switch behavior. Accounts sharing
-  a Codex continuation home can resume natively; other configurations may use a
-  transcript handoff. T3 controls native background-task behavior during a switch.
+- Context continuity follows T3's account-switch behavior. Codex accounts sharing
+  a continuation home can resume natively. T3 can hand off thread context between
+  isolated profiles, including on Antigravity. T3 also controls background-task
+  behavior during a switch.
 - The watcher uses T3's existing server guard. It cannot add an atomic condition
   for every external observation, such as a user changing the model immediately
   before dispatch. It never intentionally changes a running thread.
@@ -166,9 +169,9 @@ mode `0600`. A crash can leave a T3 session active until its 12-hour expiry.
 The app's release label is used only for logs and restart detection. On each
 connection the watcher negotiates orchestration protocol 2 and validates the
 provider catalog, account usage, thread state, model selections, and a sample
-thread projection. Live connections also verify provider refresh and check that
-the dispatch and writer-release methods reject nonexistent target IDs. No
-existing thread is used for a deliberately invalid stop request.
+thread projection per provider when available. Live connections also verify
+provider refresh and check that the dispatch and writer-release methods reject
+nonexistent target IDs.
 
 The watcher checks the server's identity on every poll and before sending a
 recovery mutation. A changed process, start time, address, or version triggers
@@ -178,7 +181,12 @@ when its interfaces remain compatible.
 
 Extra response fields and both list and legacy dictionary model options are
 accepted. Missing methods or required fields identify the specific incompatible
-operation in health/status output. The watcher keeps retrying so recovery can
+operation in health/status output. When T3 omits the source message from a bounded projection, the watcher reads
+only its ID, role, and idle-compaction marker from the local database in read-only
+mode. Prompt text is never returned by this fallback. Unknown layouts or missing
+metadata leave recovery blocked rather than guessing whether a run was maintenance.
+
+The watcher keeps retrying so recovery can
 resume after the interface becomes available again.
 
 These checks establish availability and known response shapes. Invalid-target
