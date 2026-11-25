@@ -296,10 +296,12 @@ test('holds continuation until the previous writer releases, then resumes once',
     assert.equal(h.saved.at(-1).attempts['thread-1:run-1'].writerRelease.status, 'pending');
     releases++; return { outcome: 'shared' };
   };
-  await h.watcher.tick(); await h.watcher.tick();
+  assert.equal(await h.watcher.tick(), 500);
+  assert.equal(await h.watcher.tick(), 500);
   assert.equal(releases, 1); assert.equal(h.commands.length, 0);
   held = false;
-  await h.watcher.tick(); await h.watcher.tick();
+  assert.equal(await h.watcher.tick(), f.config.pollSeconds * 1000);
+  await h.watcher.tick();
   assert.equal(h.commands.length, 1); assert.equal(releases, 1);
 });
 
@@ -326,7 +328,7 @@ test('a prolonged lock wait keeps checking without repeatedly stopping the clien
   h.client.releaseWriter = async () => { releases++; return { outcome: 'released' }; };
   await h.watcher.tick();
   time += (f.config.writerReleaseWaitSeconds + 1) * 1000;
-  await h.watcher.tick();
+  assert.equal(await h.watcher.tick(), f.config.pollSeconds * 1000);
   assert.match(h.logs.at(-1).reason, /still held/);
   assert.equal(releases, 1); assert.equal(h.commands.length, 0);
   held = false; await h.watcher.tick();
