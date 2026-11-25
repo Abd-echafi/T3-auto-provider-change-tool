@@ -55,7 +55,7 @@ environment; do not start multiple live watchers with different state directorie
 
 ## What happens at a usage limit
 
-1. Every 10 seconds, the watcher checks for a failed thread whose root failure
+1. Every 2 seconds by default, the watcher checks for a failed thread whose root failure
    T3 classified as `usage_limit`.
 2. It confirms the run is still the latest and has no active turn, queued turn,
    pending user request, or pending background task. It excludes idle compaction
@@ -104,7 +104,7 @@ Project and thread filters are combined when both are supplied.
 | `antigravityAccountOrder` | discovered Antigravity accounts | Antigravity account IDs in rotation order |
 | `threadIds` | `[]` | Optional thread allowlist |
 | `projectIds` | `[]` | Optional project allowlist |
-| `pollSeconds` | `10` | Failure detection interval |
+| `pollSeconds` | `2` | Failure detection interval. After requesting a Codex writer release, the watcher waits only 500 ms between checks for the first 10 seconds. |
 | `refreshSeconds` | `300` | Quota refresh interval |
 | `usageMaxAgeSeconds` | `600` | Maximum age of an eligible quota snapshot |
 | `maxSwitchesPerHour` | `4` | Maximum automatic recovery attempts per thread per hour |

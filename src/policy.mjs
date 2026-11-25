@@ -4,7 +4,7 @@ export const SUPPORTED_DRIVERS = ['codex', 'antigravity'];
 
 export const DEFAULTS = {
   accountOrder: [], antigravityAccountOrder: [], projectIds: [], threadIds: [],
-  pollSeconds: 10, refreshSeconds: 300, usageMaxAgeSeconds: 600,
+  pollSeconds: 2, refreshSeconds: 300, usageMaxAgeSeconds: 600,
   failureMaxAgeHours: 336, maxSwitchesPerHour: 4,
   unknownResetCooldownSeconds: 300,
   writerReleaseWaitSeconds: 300,

@@ -109,6 +109,7 @@ async function watch(config) {
     if (!dryRun) await writeJson(statePath, state);
     log({ event: 'started', dryRun, pollSeconds: config.pollSeconds, watchingSince: state.startedAt });
     while (!abort.signal.aborted) {
+      let nextPollMs = config.pollSeconds * 1000;
       try {
         if (!client?.connected || !await client.runtimeUnchanged()) {
           await client?.close();
@@ -117,7 +118,7 @@ async function watch(config) {
           watcher = new Watcher({ client, config, state, dryRun, save: value => writeJson(statePath, value), log });
           log({ event: 'connected', serverVersion: client.version, compatibility: client.compatibility });
         }
-        await watcher.tick();
+        nextPollMs = await watcher.tick();
         Object.assign(health, { connected: true, serverVersion: client.version,
           lastSuccessfulPollAt: new Date().toISOString(), error: null, status: 'healthy',
           compatibility: client.compatibility });
@@ -131,7 +132,7 @@ async function watch(config) {
         if (!dryRun) await writeJson(healthPath, health);
         if (once) throw error;
       }
-      try { await sleep(config.pollSeconds * 1000, undefined, { signal: abort.signal }); }
+      try { await sleep(nextPollMs, undefined, { signal: abort.signal }); }
       catch (error) { if (error.name !== 'AbortError') throw error; }
     }
   } finally {

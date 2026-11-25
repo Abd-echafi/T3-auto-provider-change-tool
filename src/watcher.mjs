@@ -39,24 +39,24 @@ export class Watcher {
     }
   }
 
-  async writerReady(attempt, projection, shell, source) {
+  async checkWriter(attempt, projection, shell, source) {
     const lock = await this.writerGuard.probe(projection, source);
     if (lock.status === 'unknown') {
       this.notice(shell.id, `Cannot verify writer release: ${lock.reason}.`);
-      return false;
+      return 'blocked';
     }
-    if (lock.status === 'free') return true;
-    const now = this.now();
+    if (lock.status === 'free') return 'ready';
     if (!attempt.writerRelease) {
       // This phase is persisted before requesting a stop. On a lost response,
       // retry with the same source run guard, never an unguarded session detach.
-      attempt.writerRelease = { at: now, status: 'pending' };
+      attempt.writerRelease = { at: this.now(), status: 'pending' };
       await this.save(this.state);
     }
     if (attempt.writerRelease.status === 'pending') {
       try {
         const result = await this.client.releaseWriter(shell.id, attempt.runId);
         attempt.writerRelease.status = 'requested';
+        attempt.writerRelease.at = this.now();
         attempt.writerRelease.outcome = result.outcome;
         await this.save(this.state);
         this.log({ event: 'writer-release-requested', threadId: shell.id, runId: attempt.runId, outcome: result.outcome });
@@ -65,13 +65,14 @@ export class Watcher {
         attempt.status = 'release-rejected';
         await this.save(this.state);
         this.notice(shell.id, 'T3 rejected writer release; the stopped run may have changed.');
-        return false;
+        return 'blocked';
       }
     }
-    if (now - attempt.writerRelease.at >= this.config.writerReleaseWaitSeconds * 1000) {
+    const waitMs = this.now() - attempt.writerRelease.at;
+    if (waitMs >= this.config.writerReleaseWaitSeconds * 1000) {
       this.notice(shell.id, 'Conversation writer is still held. Close its owning Codex client; automatic recovery is waiting.');
     } else this.notice(shell.id, 'Waiting for the old Codex client to release the conversation writer.');
-    return false;
+    return waitMs < 10_000 ? 'retry-soon' : 'blocked';
   }
 
   notice(threadId, reason, details = {}) {
@@ -82,6 +83,7 @@ export class Watcher {
   }
 
   async tick() {
+    let nextPollMs = this.config.pollSeconds * 1000;
     const now = this.now();
     if (now - this.lastRefresh >= this.config.refreshSeconds * 1000) {
       await this.client.refreshProviders();
@@ -163,7 +165,11 @@ export class Watcher {
       }
       // Codex can retain a native writer across an account switch. Antigravity
       // uses T3's provider handoff between isolated profiles instead.
-      if (source.driver === 'codex' && !await this.writerReady(attempt, projection, shell, source)) continue;
+      if (source.driver === 'codex') {
+        const writer = await this.checkWriter(attempt, projection, shell, source);
+        if (writer === 'retry-soon') nextPollMs = Math.min(nextPollMs, 500);
+        if (writer !== 'ready') continue;
+      }
       const current = (await this.client.getShell()).threads.find(t => t.id === shell.id);
       if (!current || !shellEligible(current, this.config, this.state, now, source.driver) || current.latestRunId !== run.id ||
           current.providerInstanceId !== shell.providerInstanceId || current.runtimeMode !== shell.runtimeMode ||
@@ -188,5 +194,6 @@ export class Watcher {
         } else throw error;
       }
     }
+    return nextPollMs;
   }
 }
